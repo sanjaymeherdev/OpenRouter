@@ -1,4 +1,112 @@
+// server.js
+import express from "express";
+import cors from "cors";
+import dotenv from "dotenv";
+import { v4 as uuidv4 } from "uuid";
+import { getRedis } from "./redisClient.js";
+import { query } from "./db/index.js";
 
+dotenv.config();
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+app.use(express.static("public"));
+
+const API_KEY = process.env.OPENROUTER_API_KEY;
+if (!API_KEY) console.warn("WARNING: OPENROUTER_API_KEY not set.");
+
+const MODELS_CACHE_KEY = "openrouter:free_models_full";
+const MODELS_CACHE_TTL = 60 * 30; // 30 min — free model list changes often
+
+// Excludes models that don't work with the chat/completions + tool-calling
+// flow below (music/audio generation, content-safety classifiers).
+const EXCLUDED_IDS = new Set([
+  "google/lyria-3-clip-preview",
+  "google/lyria-3-pro-preview",
+  "nvidia/nemotron-3.5-content-safety:free",
+]);
+
+async function fetchFreeModelsLive() {
+  const res = await fetch("https://openrouter.ai/api/v1/models");
+  if (!res.ok) throw new Error(`OpenRouter models fetch failed: ${res.status}`);
+  const data = await res.json();
+  const all = data.data || [];
+
+  return all
+    .filter((m) => {
+      if (EXCLUDED_IDS.has(m.id)) return false;
+      const promptPrice = parseFloat(m.pricing?.prompt ?? "1");
+      const completionPrice = parseFloat(m.pricing?.completion ?? "1");
+      return promptPrice === 0 && completionPrice === 0;
+    })
+    .map((m) => ({
+      id: m.id,
+      name: m.name,
+      context_length: m.context_length,
+      input_modalities: m.architecture?.input_modalities || ["text"],
+      output_modalities: m.architecture?.output_modalities || ["text"],
+      supports_tools: (m.supported_parameters || []).includes("tools"),
+      supports_reasoning: (m.supported_parameters || []).includes("reasoning"),
+      description: (m.description || "").slice(0, 200),
+    }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+// ---------- Tool definitions (function calling demo) ----------
+const TOOLS = [
+  {
+    type: "function",
+    function: {
+      name: "calculator",
+      description: "Evaluate a basic arithmetic expression.",
+      parameters: {
+        type: "object",
+        properties: {
+          expression: { type: "string", description: "e.g. '12 * (3 + 4)'" },
+        },
+        required: ["expression"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "get_current_time",
+      description: "Get the current server time in ISO format.",
+      parameters: { type: "object", properties: {} },
+    },
+  },
+];
+
+function runTool(name, args) {
+  if (name === "calculator") {
+    try {
+      // eslint-disable-next-line no-new-func
+      const result = Function(`"use strict"; return (${args.expression});`)();
+      return String(result);
+    } catch (e) {
+      return `Error evaluating expression: ${e.message}`;
+    }
+  }
+  if (name === "get_current_time") {
+    return new Date().toISOString();
+  }
+  return `Unknown tool: ${name}`;
+}
+
+// ---------- Rate limiting via Redis (per-IP, fixed 60s window) ----------
+async function rateLimit(req, res, next) {
+  try {
+    const redis = await getRedis();
+    const ip = req.ip || "unknown";
+    const key = `ratelimit:${ip}`;
+    if (redis) {
+      const count = await redis.incr(key);
+      if (count === 1) await redis.expire(key, 60);
+      if (count > 15) {
+        return res.status(429).json({ error: "Rate limit exceeded. Try again shortly." });
+      }
     }
     next();
   } catch (err) {
