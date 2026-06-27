@@ -16,20 +16,44 @@ app.use(express.static("public"));
 const API_KEY = process.env.OPENROUTER_API_KEY;
 if (!API_KEY) console.warn("WARNING: OPENROUTER_API_KEY not set.");
 
-const MODELS_CACHE_KEY = "openrouter:free_models";
-const MODELS_CACHE_TTL = 60 * 60; // 1 hour
+const MODELS_CACHE_KEY = "openrouter:free_models_full";
+const MODELS_CACHE_TTL = 60 * 30; // 30 min — free model list changes often
 
-const FREE_MODELS = {
-  "meta-llama/llama-3.3-70b-instruct:free": "Llama 3.3 70B (general)",
-  "openai/gpt-oss-120b:free": "GPT-OSS 120B (reasoning/coding)",
-  "qwen/qwen3-coder:free": "Qwen3 Coder 480B (coding)",
-  "cohere/north-mini-code:free": "North Mini Code (fast coding)",
-  "nvidia/nemotron-3-ultra-550b-a55b:free": "Nemotron 3 Ultra (1M context)",
-  "nvidia/nemotron-nano-12b-v2-vl:free": "Nemotron Nano VL (vision)",
-  "nousresearch/hermes-3-llama-3.1-405b:free": "Hermes 3 405B (open-ended)",
-};
+// Excludes models that don't work with the chat/completions + tool-calling
+// flow below (music/audio generation, content-safety classifiers).
+const EXCLUDED_IDS = new Set([
+  "google/lyria-3-clip-preview",
+  "google/lyria-3-pro-preview",
+  "nvidia/nemotron-3.5-content-safety:free",
+]);
 
-// ---------- Simple tool definitions (function calling demo) ----------
+async function fetchFreeModelsLive() {
+  const res = await fetch("https://openrouter.ai/api/v1/models");
+  if (!res.ok) throw new Error(`OpenRouter models fetch failed: ${res.status}`);
+  const data = await res.json();
+  const all = data.data || [];
+
+  return all
+    .filter((m) => {
+      if (EXCLUDED_IDS.has(m.id)) return false;
+      const promptPrice = parseFloat(m.pricing?.prompt ?? "1");
+      const completionPrice = parseFloat(m.pricing?.completion ?? "1");
+      return promptPrice === 0 && completionPrice === 0;
+    })
+    .map((m) => ({
+      id: m.id,
+      name: m.name,
+      context_length: m.context_length,
+      input_modalities: m.architecture?.input_modalities || ["text"],
+      output_modalities: m.architecture?.output_modalities || ["text"],
+      supports_tools: (m.supported_parameters || []).includes("tools"),
+      supports_reasoning: (m.supported_parameters || []).includes("reasoning"),
+      description: (m.description || "").slice(0, 200),
+    }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+// ---------- Tool definitions (function calling demo) ----------
 const TOOLS = [
   {
     type: "function",
@@ -71,14 +95,14 @@ function runTool(name, args) {
   return `Unknown tool: ${name}`;
 }
 
-// ---------- Rate limiting via Redis (per-IP, sliding window-ish) ----------
+// ---------- Rate limiting via Redis (per-IP, fixed 60s window) ----------
 async function rateLimit(req, res, next) {
   try {
     const redis = await getRedis();
     const ip = req.ip || "unknown";
     const key = `ratelimit:${ip}`;
     const count = await redis.incr(key);
-    if (count === 1) await redis.expire(key, 60); // 60s window
+    if (count === 1) await redis.expire(key, 60);
     if (count > 15) {
       return res.status(429).json({ error: "Rate limit exceeded. Try again shortly." });
     }
@@ -91,15 +115,39 @@ async function rateLimit(req, res, next) {
 
 // ---------- Routes ----------
 
+// Full live list of free, chat-capable models (cached 30min in Redis)
 app.get("/api/models", async (req, res) => {
   try {
     const redis = await getRedis();
     const cached = await redis.get(MODELS_CACHE_KEY);
     if (cached) return res.json(JSON.parse(cached));
-    await redis.set(MODELS_CACHE_KEY, JSON.stringify(FREE_MODELS), { EX: MODELS_CACHE_TTL });
-    res.json(FREE_MODELS);
+
+    const models = await fetchFreeModelsLive();
+    await redis.set(MODELS_CACHE_KEY, JSON.stringify(models), { EX: MODELS_CACHE_TTL });
+    res.json(models);
   } catch (err) {
-    res.json(FREE_MODELS); // fallback if redis is down
+    try {
+      const models = await fetchFreeModelsLive();
+      res.json(models);
+    } catch (err2) {
+      res.status(500).json({ error: err2.message });
+    }
+  }
+});
+
+// List all sessions (sidebar history), most recent first, with a derived title
+app.get("/api/sessions", async (req, res) => {
+  try {
+    const result = await query(
+      `SELECT s.id, s.model, s.created_at,
+              (SELECT content FROM messages m WHERE m.session_id = s.id AND m.role = 'user' ORDER BY m.id ASC LIMIT 1) AS title
+       FROM sessions s
+       ORDER BY s.created_at DESC
+       LIMIT 50`
+    );
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
@@ -110,17 +158,17 @@ app.post("/api/sessions", async (req, res) => {
   const id = uuidv4();
   try {
     await query("INSERT INTO sessions (id, model) VALUES ($1, $2)", [id, model]);
-    res.json({ sessionId: id });
+    res.json({ sessionId: id, model });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// Get history for a session
+// Get message history for a session
 app.get("/api/sessions/:id/messages", async (req, res) => {
   try {
     const result = await query(
-      "SELECT role, content, created_at FROM messages WHERE session_id = $1 ORDER BY id ASC",
+      "SELECT role, content, created_at FROM messages WHERE session_id = $1 AND role != 'tool' ORDER BY id ASC",
       [req.params.id]
     );
     res.json(result.rows);
@@ -137,21 +185,21 @@ app.post("/api/chat", rateLimit, async (req, res) => {
   }
 
   try {
-    // Persist user message
     await query("INSERT INTO messages (session_id, role, content) VALUES ($1, 'user', $2)", [
       sessionId,
       message,
     ]);
 
-    // Rebuild conversation history for context
     const historyResult = await query(
       "SELECT role, content FROM messages WHERE session_id = $1 ORDER BY id ASC",
       [sessionId]
     );
     let messages = historyResult.rows.map((r) => ({ role: r.role, content: r.content }));
 
-    // Tool-calling loop (max 3 iterations to avoid infinite loops)
     let finalReply = null;
+    let lastRawResponse = null;
+    let toolsUsed = [];
+
     for (let i = 0; i < 3; i++) {
       const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
         method: "POST",
@@ -165,6 +213,7 @@ app.post("/api/chat", rateLimit, async (req, res) => {
       });
 
       const data = await response.json();
+      lastRawResponse = data;
       if (!response.ok) {
         return res.status(response.status).json({ error: data });
       }
@@ -173,18 +222,14 @@ app.post("/api/chat", rateLimit, async (req, res) => {
       const msg = choice?.message;
 
       if (msg?.tool_calls?.length) {
-        // Model wants to call a tool. Append its tool-call message, then tool results.
         messages.push(msg);
         for (const call of msg.tool_calls) {
           const args = JSON.parse(call.function.arguments || "{}");
           const toolResult = runTool(call.function.name, args);
-          messages.push({
-            role: "tool",
-            tool_call_id: call.id,
-            content: toolResult,
-          });
+          toolsUsed.push({ name: call.function.name, args, result: toolResult });
+          messages.push({ role: "tool", tool_call_id: call.id, content: toolResult });
         }
-        continue; // loop again so the model can use the tool result
+        continue;
       }
 
       finalReply = msg?.content ?? "(no response)";
@@ -198,7 +243,7 @@ app.post("/api/chat", rateLimit, async (req, res) => {
       finalReply,
     ]);
 
-    res.json({ reply: finalReply });
+    res.json({ reply: finalReply, toolsUsed, raw: lastRawResponse });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
