@@ -25,5 +25,12 @@ export async function getRedis() {
     }
     await connectPromise;
   }
+  // If connection failed or client is not ready, return null instead of broken client
+  if (!redisClient.isOpen && !redisClient.isReady) {
+    return null;
+  }
   return redisClient;
 }
+
+// Initialize Redis connection in background (don't block)
+getRedis().catch(() => {});
