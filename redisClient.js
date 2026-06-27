@@ -12,10 +12,18 @@ export const redisClient = createClient({ url: redisUrl });
 redisClient.on("error", (err) => console.error("Redis error:", err));
 
 let connected = false;
+let connectPromise = null;
+
 export async function getRedis() {
   if (!connected) {
-    await redisClient.connect();
-    connected = true;
+    if (!connectPromise) {
+      connectPromise = redisClient.connect().catch((err) => {
+        console.warn("Redis connection failed, proceeding without caching:", err.message);
+        connected = true; // Mark as "done trying" so we don't retry endlessly
+        return null;
+      });
+    }
+    await connectPromise;
   }
   return redisClient;
 }
