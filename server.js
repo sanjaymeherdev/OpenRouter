@@ -3,7 +3,6 @@ import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import { v4 as uuidv4 } from "uuid";
-import { getRedis } from "./redisClient.js";
 import { query } from "./db/index.js";
 
 dotenv.config();
@@ -15,9 +14,6 @@ app.use(express.static("public"));
 
 const API_KEY = process.env.OPENROUTER_API_KEY;
 if (!API_KEY) console.warn("WARNING: OPENROUTER_API_KEY not set.");
-
-const MODELS_CACHE_KEY = "openrouter:free_models_full";
-const MODELS_CACHE_TTL = 60 * 30; // 30 min — free model list changes often
 
 // Excludes models that don't work with the chat/completions + tool-calling
 // flow below (music/audio generation, content-safety classifiers).
@@ -51,6 +47,28 @@ async function fetchFreeModelsLive() {
       description: (m.description || "").slice(0, 200),
     }))
     .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+let cachedModels = null;
+let modelsFetchTime = 0;
+const MODELS_CACHE_TTL = 60 * 30; // 30 min — free model list changes often
+
+async function getCachedModels() {
+  const now = Date.now();
+  if (cachedModels && now - modelsFetchTime < MODELS_CACHE_TTL * 1000) {
+    return cachedModels;
+  }
+  try {
+    cachedModels = await fetchFreeModelsLive();
+    modelsFetchTime = now;
+    return cachedModels;
+  } catch (err) {
+    console.error("Models fetch error:", err.message);
+    if (cachedModels) {
+      return cachedModels;
+    }
+    throw err;
+  }
 }
 
 // ---------- Tool definitions (function calling demo) ----------
@@ -95,56 +113,49 @@ function runTool(name, args) {
   return `Unknown tool: ${name}`;
 }
 
-// ---------- Rate limiting via Redis (per-IP, fixed 60s window) ----------
+// ---------- Rate limiting via in-memory store (per-IP, fixed 60s window) ----------
+const rateLimitStore = new Map();
+
 async function rateLimit(req, res, next) {
-  try {
-    const redis = await getRedis();
-    const ip = req.ip || "unknown";
-    const key = `ratelimit:${ip}`;
-    if (redis) {
-      const count = await redis.incr(key);
-      if (count === 1) await redis.expire(key, 60);
-      if (count > 15) {
-        return res.status(429).json({ error: "Rate limit exceeded. Try again shortly." });
-      }
+  const ip = req.ip || "unknown";
+  const key = `ratelimit:${ip}`;
+  const now = Date.now();
+  const windowMs = 60 * 1000; // 60 seconds
+  const maxRequests = 15;
+
+  let record = rateLimitStore.get(key);
+  if (!record || now - record.startTime > windowMs) {
+    record = { count: 1, startTime: now };
+    rateLimitStore.set(key, record);
+  } else {
+    record.count++;
+    if (record.count > maxRequests) {
+      return res.status(429).json({ error: "Rate limit exceeded. Try again shortly." });
     }
-    next();
-  } catch (err) {
-    console.error("Rate limit check failed (allowing request):", err.message);
-    next();
   }
+  next();
 }
+
+// Clean up old entries periodically
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, record] of rateLimitStore.entries()) {
+    if (now - record.startTime > 60 * 1000) {
+      rateLimitStore.delete(key);
+    }
+  }
+}, 60 * 1000);
 
 // ---------- Routes ----------
 
-// Full live list of free, chat-capable models (cached 30min in Redis)
+// Full live list of free, chat-capable models (cached in-memory for 30min)
 app.get("/api/models", async (req, res) => {
   try {
-    const redis = await getRedis();
-    if (redis) {
-      const cached = await redis.get(MODELS_CACHE_KEY);
-      if (cached) return res.json(JSON.parse(cached));
-    }
-
-    const models = await fetchFreeModelsLive();
-    if (redis) {
-      try {
-        await redis.set(MODELS_CACHE_KEY, JSON.stringify(models), { EX: MODELS_CACHE_TTL });
-      } catch (redisErr) {
-        console.warn("Failed to cache models:", redisErr.message);
-      }
-    }
+    const models = await getCachedModels();
     res.json(models);
   } catch (err) {
     console.error("Models fetch error:", err.message);
-    // Fallback: try direct fetch without caching
-    try {
-      const models = await fetchFreeModelsLive();
-      res.json(models);
-    } catch (err2) {
-      console.error("Fallback models fetch failed:", err2.message);
-      res.status(500).json({ error: err2.message });
-    }
+    res.status(500).json({ error: err.message });
   }
 });
 
