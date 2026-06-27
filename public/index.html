@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Free Model Chat</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 700px; margin: 40px auto; background: #0f1115; color: #e6e6e6; }
+  select, textarea, button { width: 100%; margin-top: 8px; padding: 10px; border-radius: 6px; border: 1px solid #333; background: #1a1d24; color: #e6e6e6; }
+  button { background: #4a7dff; cursor: pointer; border: none; font-weight: 600; }
+  button:hover { background: #3a6aee; }
+  #chatLog { margin-top: 20px; display: flex; flex-direction: column; gap: 12px; }
+  .msg { padding: 10px 14px; border-radius: 8px; white-space: pre-wrap; max-width: 90%; }
+  .user { background: #2a2d36; align-self: flex-end; }
+  .assistant { background: #1c3a52; align-self: flex-start; }
+  label { font-size: 13px; color: #999; margin-top: 16px; display: block; }
+  #sessionInfo { font-size: 12px; color: #777; margin-top: 8px; }
+</style>
+</head>
+<body>
+  <h2>Free Model Chat (OpenRouter + Redis + Postgres)</h2>
+
+  <label>Model</label>
+  <select id="modelSelect"></select>
+  <button onclick="newSession()">Start New Session</button>
+  <div id="sessionInfo"></div>
+
+  <label>Message</label>
+  <textarea id="input" rows="4" placeholder="Type your message... (try: 'what is 23*17?')"></textarea>
+  <button onclick="sendMessage()">Send</button>
+
+  <div id="chatLog"></div>
+
+  <script>
+    let sessionId = null;
+
+    async function loadModels() {
+      const res = await fetch("/api/models");
+      const models = await res.json();
+      const select = document.getElementById("modelSelect");
+      select.innerHTML = "";
+      for (const [id, label] of Object.entries(models)) {
+        const opt = document.createElement("option");
+        opt.value = id;
+        opt.textContent = label;
+        select.appendChild(opt);
+      }
+    }
+
+    async function newSession() {
+      const model = document.getElementById("modelSelect").value;
+      const res = await fetch("/api/sessions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model }),
+      });
+      const data = await res.json();
+      sessionId = data.sessionId;
+      document.getElementById("sessionInfo").textContent = "Session: " + sessionId;
+      document.getElementById("chatLog").innerHTML = "";
+    }
+
+    function addMessage(role, text) {
+      const div = document.createElement("div");
+      div.className = "msg " + role;
+      div.textContent = text;
+      document.getElementById("chatLog").appendChild(div);
+    }
+
+    async function sendMessage() {
+      if (!sessionId) await newSession();
+
+      const input = document.getElementById("input");
+      const model = document.getElementById("modelSelect").value;
+      const text = input.value.trim();
+      if (!text) return;
+
+      addMessage("user", text);
+      input.value = "";
+
+      const res = await fetch("/api/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sessionId, model, message: text }),
+      });
+      const data = await res.json();
+
+      if (data.error) {
+        addMessage("assistant", "Error: " + JSON.stringify(data.error));
+        return;
+      }
+      addMessage("assistant", data.reply);
+    }
+
+    loadModels();
+  </script>
+</body>
+</html>
