@@ -123,13 +123,20 @@ app.get("/api/models", async (req, res) => {
     if (cached) return res.json(JSON.parse(cached));
 
     const models = await fetchFreeModelsLive();
-    await redis.set(MODELS_CACHE_KEY, JSON.stringify(models), { EX: MODELS_CACHE_TTL });
+    try {
+      await redis.set(MODELS_CACHE_KEY, JSON.stringify(models), { EX: MODELS_CACHE_TTL });
+    } catch (redisErr) {
+      console.warn("Failed to cache models:", redisErr.message);
+    }
     res.json(models);
   } catch (err) {
+    console.error("Models fetch error:", err.message);
+    // Fallback: try direct fetch without caching
     try {
       const models = await fetchFreeModelsLive();
       res.json(models);
     } catch (err2) {
+      console.error("Fallback models fetch failed:", err2.message);
       res.status(500).json({ error: err2.message });
     }
   }
